@@ -19,13 +19,57 @@ jobs:
         id: date
         run: echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
       
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-      
       - name: Download Ontario OSM data
         run: |
           wget https://download.geofabrik.de/north-america/canada/ontario-latest.osm.pbf
           ls -lh ontario-latest.osm.pbf
+      
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+      
+      - name: Download GraphHopper
+        run: |
+          wget https://github.com/graphhopper/graphhopper/releases/download/11.0/graphhopper-web-11.0.jar
+          ls -lh graphhopper-web-11.0.jar
+      
+      - name: Create GraphHopper config
+        run: |
+          mkdir -p graph-cache
+          cat > config.yml << 'EOF'
+          graphhopper:
+            datareader.file: ontario-latest.osm.pbf
+            graph.location: graph-cache
+            graph.encoded_values: car_access, car_average_speed, road_access
+
+            import.osm.ignored_highways: footway,cycleway,path,pedestrian,steps
+            
+            profiles:
+              - name: car
+                weighting: custom
+                custom_model:
+                  speed:
+                    - if: "true"
+                      limit_to: car_average_speed
+                  priority:
+                    - if: "road_access == DESTINATION"
+                      multiply_by: 0
+            
+            prepare.min_network_size: 200
+            prepare.min_one_way_network_size: 200
+          EOF
+          cat config.yml
+      
+      - name: Build GraphHopper cache
+        run: |
+          java -Xmx4g -jar graphhopper-web-11.0.jar import config.yml
+          ls -lh graph-cache/
+          du -sh graph-cache/
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
       
       - name: Build Rust extractor
         run: |
@@ -36,24 +80,32 @@ jobs:
         run: |
           ./target/release/osm-extractor ontario-latest.osm.pbf
           ls -lh osm_data.db
+          rm -f poi_data.json address_data.json
       
-      - name: Compress database
+      - name: Create release bundle
         run: |
-          gzip -9 osm_data.db
-          mv osm_data.db.gz osm_data_${{ steps.date.outputs.date }}.db.gz
-          ls -lh osm_data_*.db.gz
+          mkdir ontario-routing-data
+          cp osm_data.db ontario-routing-data/
+          cp -r graph-cache ontario-routing-data/
+          tar -czf ontario-routing-data_${{ steps.date.outputs.date }}.tar.gz ontario-routing-data/
+          ls -lh ontario-routing-data_*.tar.gz
+          du -sh ontario-routing-data/
       
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: osm-${{ steps.date.outputs.date }}
-          name: OSM Database - ${{ steps.date.outputs.date }}
+          tag_name: routing-${{ steps.date.outputs.date }}
+          name: Routing Data - ${{ steps.date.outputs.date }}
           body: |
-            Pre-built OSM database for Ontario
-            - Built: ${{ steps.date.outputs.date }}
-            - Source: ontario-latest.osm.pbf from Geofabrik
+            Pre-built routing data for Ontario
+            
+            Includes:
+            - POI Database (SQLite)
+            - GraphHopper Graph Cache
+            
+            Built from ontario-latest.osm.pbf
           files: |
-            osm_data_*.db.gz
+            ontario-routing-data_*.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       
