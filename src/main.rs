@@ -4,8 +4,6 @@ use rusqlite::{params, Connection, Result as SqlResult};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
-use std::fs::File;
-use std::io::BufWriter;
 use std::time::Instant;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -34,16 +32,6 @@ struct Address {
     latitude: f64,
     longitude: f64,
     full_address: String,
-}
-
-#[derive(Debug, Serialize)]
-struct PoiData {
-    pois: Vec<PointOfInterest>,
-}
-
-#[derive(Debug, Serialize)]
-struct AddressData {
-    addresses: Vec<Address>,
 }
 
 #[derive(Clone, Debug)]
@@ -295,6 +283,37 @@ fn find_nearest_address(
         nearest.street.clone(),
         nearest.city.clone(),
     ))
+}
+
+fn enrich_pois_with_addresses(
+    pois: &mut Vec<PointOfInterest>,
+    address_index: &RTree<AddressPoint>,
+) {
+    println!("Enriching POIs with nearest addresses...");
+    let start = Instant::now();
+    let mut enriched_count = 0;
+
+    for poi in pois.iter_mut() {
+        // only enrich if missing street or housenumber
+        if poi.street.is_empty() || poi.housenumber.is_empty() {
+            if let Some((nearest_num, nearest_street, nearest_city)) =
+                find_nearest_address(address_index, poi.latitude, poi.longitude)
+            {
+                poi.housenumber = nearest_num;
+                poi.street = nearest_street;
+                if poi.city.is_empty() {
+                    poi.city = nearest_city;
+                }
+                enriched_count += 1;
+            }
+        }
+    }
+
+    println!(
+        "  ✓ Enriched {} POIs with nearest addresses in {:.2?}",
+        enriched_count,
+        start.elapsed()
+    );
 }
 
 fn export_to_sqlite(
@@ -650,6 +669,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("✓ Pass 2 complete in {:.2?}", pass2_start.elapsed());
     println!();
 
+    enrich_pois_with_addresses(&mut pois, &address_index);
+    println!();
+
     println!("Final Results:");
     println!(
         "  POIs found: {} ({} from nodes, {} from ways)",
@@ -667,26 +689,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  POIs with address info: {}", pois_with_address);
     println!();
 
-    // saving the files
-    println!("Saving results...");
-    let poi_file = File::create("poi_data.json")?;
-    let poi_output = PoiData {
-        pois: pois.clone(), // cloning for json
-    };
-    serde_json::to_writer_pretty(BufWriter::new(poi_file), &poi_output)?;
-    println!("✓ Saved {} POIs", pois.len());
-
-    // saving addresses
-    println!("Saving addresses to address_data.json...");
-    let addr_file = File::create("address_data.json")?;
-    let addr_output = AddressData {
-        addresses: addresses.clone(), // cloning for json
-    };
-    serde_json::to_writer_pretty(BufWriter::new(addr_file), &addr_output)?;
-    println!("✓ Saved {} addresses", addresses.len());
-    println!();
-
-    // now we can use pois and addresses for the sqlite database
     export_to_sqlite(&pois, &addresses, "osm_data.db")
         .map_err(|e| format!("SQLite export failed: {}", e))?;
 
