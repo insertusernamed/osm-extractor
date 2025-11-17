@@ -1,4 +1,5 @@
 use osmpbf::{Element, ElementReader};
+use rstar::RTree;
 use rusqlite::{params, Connection, Result as SqlResult};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -45,13 +46,36 @@ struct AddressData {
     addresses: Vec<Address>,
 }
 
+#[derive(Clone, Debug)]
+struct AddressPoint {
+    housenumber: String,
+    street: String,
+    city: String,
+    point: [f64; 2],
+}
+
+impl rstar::RTreeObject for AddressPoint {
+    type Envelope = rstar::AABB<[f64; 2]>;
+
+    fn envelope(&self) -> Self::Envelope {
+        rstar::AABB::from_point(self.point)
+    }
+}
+
+impl rstar::PointDistance for AddressPoint {
+    fn distance_2(&self, point: &[f64; 2]) -> f64 {
+        let dx = self.point[0] - point[0];
+        let dy = self.point[1] - point[1];
+        dx * dx + dy * dy
+    }
+}
+
 // category mapping
 fn get_category_mapping() -> HashMap<String, HashMap<String, String>> {
     let mut category_map: HashMap<String, HashMap<String, String>> = HashMap::new();
 
     // amenity mappings
     let mut amenity_map = HashMap::new();
-
     // food and dining places
     amenity_map.insert("restaurant".to_string(), "food".to_string());
     amenity_map.insert("cafe".to_string(), "food".to_string());
@@ -97,7 +121,6 @@ fn get_category_mapping() -> HashMap<String, HashMap<String, String>> {
     amenity_map.insert("college".to_string(), "education".to_string());
     amenity_map.insert("library".to_string(), "education".to_string());
     amenity_map.insert("kindergarten".to_string(), "education".to_string());
-
     category_map.insert("amenity".to_string(), amenity_map);
 
     // shop mappings
@@ -114,7 +137,6 @@ fn get_category_mapping() -> HashMap<String, HashMap<String, String>> {
     shop_map.insert("butcher".to_string(), "shopping".to_string());
     shop_map.insert("florist".to_string(), "shopping".to_string());
     shop_map.insert("hardware".to_string(), "shopping".to_string());
-
     category_map.insert("shop".to_string(), shop_map);
 
     // tourism mappings
@@ -127,7 +149,6 @@ fn get_category_mapping() -> HashMap<String, HashMap<String, String>> {
     tourism_map.insert("museum".to_string(), "entertainment".to_string());
     tourism_map.insert("gallery".to_string(), "entertainment".to_string());
     tourism_map.insert("viewpoint".to_string(), "entertainment".to_string());
-
     category_map.insert("tourism".to_string(), tourism_map);
 
     // leisure mappings
@@ -139,7 +160,6 @@ fn get_category_mapping() -> HashMap<String, HashMap<String, String>> {
     leisure_map.insert("swimming_pool".to_string(), "entertainment".to_string());
     leisure_map.insert("fitness_centre".to_string(), "entertainment".to_string());
     leisure_map.insert("golf_course".to_string(), "entertainment".to_string());
-
     category_map.insert("leisure".to_string(), leisure_map);
 
     // office mappings
@@ -149,7 +169,6 @@ fn get_category_mapping() -> HashMap<String, HashMap<String, String>> {
         "education".to_string(),
     );
     office_map.insert("university".to_string(), "education".to_string());
-
     category_map.insert("office".to_string(), office_map);
 
     // education key mappings
@@ -157,7 +176,6 @@ fn get_category_mapping() -> HashMap<String, HashMap<String, String>> {
     education_map.insert("school".to_string(), "education".to_string());
     education_map.insert("university".to_string(), "education".to_string());
     education_map.insert("college".to_string(), "education".to_string());
-
     category_map.insert("education".to_string(), education_map);
 
     // building mappings
@@ -165,7 +183,6 @@ fn get_category_mapping() -> HashMap<String, HashMap<String, String>> {
     building_map.insert("college".to_string(), "education".to_string());
     building_map.insert("university".to_string(), "education".to_string());
     building_map.insert("school".to_string(), "education".to_string());
-
     category_map.insert("building".to_string(), building_map);
 
     category_map
@@ -179,6 +196,7 @@ fn process_node_tags(
     category_map: &HashMap<String, HashMap<String, String>>,
     pois: &mut Vec<PointOfInterest>,
     addresses: &mut Vec<Address>,
+    address_index: &mut RTree<AddressPoint>,
 ) {
     // checking for points of interest
     let mut category: Option<String> = None;
@@ -243,9 +261,9 @@ fn process_node_tags(
 
         addresses.push(Address {
             id: node_id,
-            housenumber,
-            street,
-            city,
+            housenumber: housenumber.clone(),
+            street: street.clone(),
+            city: city.clone(),
             postcode,
             suburb,
             place,
@@ -253,7 +271,30 @@ fn process_node_tags(
             longitude: lon,
             full_address: full_addr.trim().to_string(),
         });
+
+        // we add to spatial index if we have meaningful address data
+        if !street.is_empty() && !housenumber.is_empty() {
+            address_index.insert(AddressPoint {
+                housenumber,
+                street,
+                city,
+                point: [lon, lat],
+            });
+        }
     }
+}
+
+fn find_nearest_address(
+    index: &RTree<AddressPoint>,
+    lat: f64,
+    lon: f64,
+) -> Option<(String, String, String)> {
+    let nearest = index.nearest_neighbor(&[lon, lat])?;
+    Some((
+        nearest.housenumber.clone(),
+        nearest.street.clone(),
+        nearest.city.clone(),
+    ))
 }
 
 fn export_to_sqlite(
@@ -261,37 +302,38 @@ fn export_to_sqlite(
     addresses: &[Address],
     db_path: &str,
 ) -> SqlResult<()> {
-    println!("💾 Creating SQLite database at {}...", db_path);
+    println!("Creating SQLite database at {}...", db_path);
 
     // creating the database connection
     let conn = Connection::open(db_path)?;
 
     // creating the pois table with indexes
     conn.execute(
-    "CREATE TABLE IF NOT EXISTS pois (
-        id INTEGER PRIMARY KEY,
-        name TEXT NOT NULL,
-        category TEXT NOT NULL,
-        subcategory TEXT,
-        latitude REAL NOT NULL,
-        longitude REAL NOT NULL,
-        housenumber TEXT,
-        street TEXT,
-        city TEXT,
-        osm_type TEXT,
-        full_address TEXT GENERATED ALWAYS AS (
-            CASE 
-                WHEN housenumber IS NOT NULL AND housenumber != '' AND street IS NOT NULL AND street != '' 
+        "CREATE TABLE IF NOT EXISTS pois (
+            id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            category TEXT NOT NULL,
+            subcategory TEXT,
+            latitude REAL NOT NULL,
+            longitude REAL NOT NULL,
+            housenumber TEXT,
+            street TEXT,
+            city TEXT,
+            osm_type TEXT NOT NULL,
+            full_address TEXT GENERATED ALWAYS AS (
+                CASE
+                    WHEN housenumber IS NOT NULL AND housenumber != '' AND street IS NOT NULL AND street != ''
                     THEN housenumber || ' ' || street || CASE WHEN city != '' THEN ', ' || city ELSE '' END
-                WHEN street IS NOT NULL AND street != '' 
+                    WHEN street IS NOT NULL AND street != ''
                     THEN street || CASE WHEN city != '' THEN ', ' || city ELSE '' END
-                WHEN city IS NOT NULL AND city != '' 
+                    WHEN city IS NOT NULL AND city != ''
                     THEN city
-                ELSE ''
-            END
-        ) STORED
-    )",
-    [],
+                    ELSE ''
+                END
+            ) STORED,
+            PRIMARY KEY (osm_type, id)
+        )",
+        [],
     )?;
 
     // creating indexes for quick autocomplete searches
@@ -299,17 +341,14 @@ fn export_to_sqlite(
         "CREATE INDEX IF NOT EXISTS idx_poi_name ON pois(name COLLATE NOCASE)",
         [],
     )?;
-
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_poi_full_address ON pois(full_address COLLATE NOCASE)",
         [],
     )?;
-
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_poi_category ON pois(category)",
         [],
     )?;
-
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_poi_city ON pois(city COLLATE NOCASE)",
         [],
@@ -337,7 +376,6 @@ fn export_to_sqlite(
         "CREATE INDEX IF NOT EXISTS idx_addr_full ON addresses(full_address COLLATE NOCASE)",
         [],
     )?;
-
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_addr_street ON addresses(street COLLATE NOCASE)",
         [],
@@ -351,7 +389,7 @@ fn export_to_sqlite(
     {
         let mut stmt = tx.prepare(
             "INSERT INTO pois (id, name, category, subcategory, latitude, longitude, housenumber, city, street, osm_type)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         )?;
 
         for poi in pois {
@@ -372,15 +410,13 @@ fn export_to_sqlite(
 
     tx.commit()?;
     println!("  ✓ POIs inserted");
-
     println!("  Inserting {} addresses...", addresses.len());
-
     let tx = conn.unchecked_transaction()?;
 
     {
         let mut stmt = tx.prepare(
             "INSERT INTO addresses (id, housenumber, street, city, postcode, suburb, place, latitude, longitude, full_address)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)"
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         )?;
 
         for addr in addresses {
@@ -407,21 +443,18 @@ fn export_to_sqlite(
     conn.execute("VACUUM", [])?;
 
     println!("✓ SQLite database created successfully");
-
     Ok(())
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
-
     if args.len() < 2 {
-        eprintln!("Usage: {} <pbf-file.osm.pbf>", args[0]);
+        eprintln!("Usage: {} <pbf_file>", args[0]);
         eprintln!("\nExample: {} ontario-latest.osm.pbf", args[0]);
         std::process::exit(1);
     }
 
     let pbf_path = &args[1];
-
     println!("{}", "=".repeat(80));
     println!("OSM PBF Fast Extractor (Rust) - Two-Pass Version");
     println!("{}", "=".repeat(80));
@@ -432,12 +465,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let category_map = get_category_mapping();
 
     // pass 1: storing all the node coordinates
-    println!("📖 PASS 1: Reading node coordinates...");
+    println!("PASS 1: Reading node coordinates...");
     let pass1_start = Instant::now();
     let mut node_coords: HashMap<i64, (f64, f64)> = HashMap::new();
-    let reader = ElementReader::from_path(pbf_path)?;
 
+    let reader = ElementReader::from_path(pbf_path)?;
     let mut count = 0;
+
     reader.for_each(|element| {
         match element {
             Element::Node(node) => {
@@ -462,10 +496,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     // pass 2: extracting pois and addresses
-    println!("📖 PASS 2: Extracting POIs and addresses...");
+    println!("PASS 2: Extracting POIs and addresses...");
     let pass2_start = Instant::now();
     let mut pois: Vec<PointOfInterest> = Vec::new();
     let mut addresses: Vec<Address> = Vec::new();
+    let mut address_index: RTree<AddressPoint> = RTree::new();
 
     let reader = ElementReader::from_path(pbf_path)?;
     let mut processed = 0;
@@ -489,6 +524,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &category_map,
                     &mut pois,
                     &mut addresses,
+                    &mut address_index,
                 );
             }
             Element::DenseNode(node) => {
@@ -508,6 +544,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &category_map,
                     &mut pois,
                     &mut addresses,
+                    &mut address_index,
                 );
             }
             Element::Way(way) => {
@@ -533,7 +570,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // extracting ways that have names and categories like georgian college
                 if category.is_some() || tags.contains_key("name") {
                     let node_refs: Vec<i64> = way.refs().collect();
-
                     if !node_refs.is_empty() {
                         let mut lat_sum = 0.0;
                         let mut lon_sum = 0.0;
@@ -552,6 +588,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let centroid_lon = lon_sum / valid_nodes as f64;
 
                             if let Some(cat) = category {
+                                let mut housenumber =
+                                    tags.get("addr:housenumber").cloned().unwrap_or_default();
+                                let mut street =
+                                    tags.get("addr:street").cloned().unwrap_or_default();
+                                let mut city = tags.get("addr:city").cloned().unwrap_or_default();
+
+                                // If no address info, find nearest address
+                                if street.is_empty() && housenumber.is_empty() {
+                                    if let Some((nearest_num, nearest_street, nearest_city)) =
+                                        find_nearest_address(
+                                            &address_index,
+                                            centroid_lat,
+                                            centroid_lon,
+                                        )
+                                    {
+                                        housenumber = nearest_num;
+                                        street = nearest_street;
+                                        if city.is_empty() {
+                                            city = nearest_city;
+                                        }
+                                    }
+                                }
+
                                 pois.push(PointOfInterest {
                                     id: way.id(),
                                     name: tags
@@ -562,12 +621,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     subcategory: subcategory.unwrap_or_default(),
                                     latitude: centroid_lat,
                                     longitude: centroid_lon,
-                                    housenumber: tags
-                                        .get("addr:housenumber")
-                                        .cloned()
-                                        .unwrap_or_default(),
-                                    city: tags.get("addr:city").cloned().unwrap_or_default(),
-                                    street: tags.get("addr:street").cloned().unwrap_or_default(),
+                                    housenumber,
+                                    city,
+                                    street,
                                     osm_type: "way".to_string(),
                                 });
                             }
@@ -594,7 +650,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("✓ Pass 2 complete in {:.2?}", pass2_start.elapsed());
     println!();
 
-    println!("📊 Final Results:");
+    println!("Final Results:");
     println!(
         "  POIs found: {} ({} from nodes, {} from ways)",
         pois.len(),
@@ -602,10 +658,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         pois.iter().filter(|p| p.osm_type == "way").count()
     );
     println!("  Addresses found: {}", addresses.len());
+
+    // count how many POIs got nearest-neighbor addresses
+    let pois_with_address = pois
+        .iter()
+        .filter(|p| !p.street.is_empty() || !p.housenumber.is_empty())
+        .count();
+    println!("  POIs with address info: {}", pois_with_address);
     println!();
 
     // saving the files
-    println!("💾 Saving results...");
+    println!("Saving results...");
     let poi_file = File::create("poi_data.json")?;
     let poi_output = PoiData {
         pois: pois.clone(), // cloning for json
@@ -614,7 +677,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("✓ Saved {} POIs", pois.len());
 
     // saving addresses
-    println!("💾 Saving addresses to address_data.json...");
+    println!("Saving addresses to address_data.json...");
     let addr_file = File::create("address_data.json")?;
     let addr_output = AddressData {
         addresses: addresses.clone(), // cloning for json
@@ -629,7 +692,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let total_time = start.elapsed();
     println!("{}", "=".repeat(80));
-    println!("✅ Complete! Total time: {:.2?}", total_time);
+    println!("Complete! Total time: {:.2?}", total_time);
     println!("{}", "=".repeat(80));
 
     Ok(())
