@@ -1,3 +1,4 @@
 /target
 *.osm.pbf
 *.db
+.DS_Store
