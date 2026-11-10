@@ -10,31 +10,45 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-    
+
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
-      
+        uses: actions/checkout@v7
+
+      # Pinned so a new Rust release cannot change how this job behaves.
+      # Formatting and linting live in ci.yml on purpose: a weekly data release
+      # must never be blocked by a warning.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.99.1
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      # Fail fast on broken code before the multi-minute download and
+      # GraphHopper import below.
+      - name: Test
+        run: cargo test
+
       - name: Get current date
         id: date
         run: echo "date=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
-      
+
       - name: Download Ontario OSM data
         run: |
           wget https://download.geofabrik.de/north-america/canada/ontario-latest.osm.pbf
           ls -lh ontario-latest.osm.pbf
-      
+
       - name: Setup Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: 'temurin'
           java-version: '17'
-      
+
       - name: Download GraphHopper
         run: |
           wget https://github.com/graphhopper/graphhopper/releases/download/11.0/graphhopper-web-11.0.jar
           ls -lh graphhopper-web-11.0.jar
-      
+
       - name: Create GraphHopper config
         run: |
           mkdir -p graph-cache
@@ -45,7 +59,7 @@ jobs:
             graph.encoded_values: car_access, car_average_speed, road_access
 
             import.osm.ignored_highways: footway,cycleway,path,pedestrian,steps
-            
+
             profiles:
               - name: car_custom
                 weighting: custom
@@ -63,27 +77,23 @@ jobs:
             prepare.min_one_way_network_size: 200
           EOF
           cat config.yml
-      
+
       - name: Build GraphHopper cache
         run: |
           java -Xmx4g -jar graphhopper-web-11.0.jar import config.yml
           ls -lh graph-cache/
           du -sh graph-cache/
-      
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-      
+
       - name: Build Rust extractor
         run: |
           cargo build --release
           ls -lh target/release/osm-extractor
-      
+
       - name: Extract OSM data
         run: |
           ./target/release/osm-extractor ontario-latest.osm.pbf
           ls -lh osm_data.db
-          rm -f poi_data.json address_data.json
-      
+
       - name: Create release bundle
         run: |
           mkdir ontario-routing-data
@@ -92,29 +102,34 @@ jobs:
           tar -czf ontario-routing-data_${{ steps.date.outputs.date }}.tar.gz ontario-routing-data/
           ls -lh ontario-routing-data_*.tar.gz
           du -sh ontario-routing-data/
-      
+
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: routing-${{ steps.date.outputs.date }}
           name: Routing Data - ${{ steps.date.outputs.date }}
           body: |
             Pre-built routing data for Ontario
-            
+
             Includes:
             - POI Database (SQLite)
             - GraphHopper Graph Cache (CH Enabled: car_custom)
-            
+
             Built from ontario-latest.osm.pbf
           files: |
             ontario-routing-data_*.tar.gz
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      
+
+      # Previously used dev-drprasad/delete-older-releases, a third-party action
+      # holding contents:write. The first-party gh CLI does the same job.
       - name: Clean up old releases
-        uses: dev-drprasad/delete-older-releases@v0.3.2
-        with:
-          keep_latest: 4
-          delete_tags: true
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release list --limit 100 --exclude-drafts --json tagName,publishedAt \
+            --jq 'sort_by(.publishedAt) | reverse | .[4:] | .[].tagName' > old-tags.txt
+          while read -r tag; do
+            if [ -n "$tag" ]; then
+              echo "Deleting release $tag"
+              gh release delete "$tag" --yes --cleanup-tag
+            fi
+          done < old-tags.txt
